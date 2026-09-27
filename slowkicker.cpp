@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <cstring>
+#include <stdint.h>
 #include <cerrno>
 #include <ctime>
 #include <csignal>
@@ -37,10 +38,32 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/file.h>
-#include <arpa/inet.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <fnmatch.h>
-#include "glconf.h"
+
+// fluffer's ONLINE row: the glftpd 2.x layout (32-bit timevals, pack 4),
+// 904 bytes.  Embedded so the kicker builds without glftpd sources.
+#pragma pack(push, 4)
+struct timeval32 { int32_t tv_sec; int32_t tv_usec; };
+struct ONLINE
+{
+    char      tagline[64];
+    char      username[24];
+    char      status[256];
+    int16_t   ssl_flag;
+    char      host[256];        // "ident@ip" at login, bare data-peer IP while transferring
+    char      currentdir[256];  // points at the file while transferring
+    int32_t   groupid;
+    int32_t   login_time;
+    timeval32 tstart;
+    timeval32 txfer;
+    uint64_t  bytes_xfer;
+    uint64_t  bytes_txfer;
+    int32_t   procid;           // transfer thread TID while transferring
+};
+#pragma pack(pop)
+static_assert(sizeof(ONLINE) == 904, "ONLINE layout mismatch");
 
 struct Directory
 {
@@ -53,7 +76,10 @@ struct Directory
 const char*       GLFTPD_ROOT   = "/glftpd";
 const char*       LOG_FILE      = "/glftpd/ftp-data/logs/slowkicker.log";
 const char*       LOCK_FILE     = "/glftpd/tmp/slowkicker.lock";
-const key_t       IPC_KEY       = 0xDEADBABE;
+const key_t       IPC_KEY       = 0x0000DEAD;  // ipc_key in fluffer.conf
+// SIGRTMIN aborts the transfer (session survives), SIGRTMIN+1 aborts and
+// closes the session.  fluffer ignores anything that isn't a tgkill.
+const int         KICK_SIGNAL   = SIGRTMIN;
 bool              ONCE_ONLY     = true;
 Directory         DIRECTORIES[] = {
     { "/site/iso/*",        125,    /* kB/s */    10,    /* seconds */  3 },
@@ -81,67 +107,22 @@ struct History
 std::deque<History> history;
 const std::size_t maxHistory = 1000;
 
-bool lookupSocketInode(int32_t procid, u_int32_t& inode)
+// The daemon is one process with one shared fd table, so /proc/<pid>/fd
+// can't attribute a socket to a transfer.  fluffer publishes the data
+// peer in the host field instead: a bare IP while transferring, the
+// "ident@ip" login form until the data connection is established.
+std::string lookupSourceAddress(const ONLINE& online)
 {
-    static const int socketMax = 20;
-
-    bool validInode = false;
-    for (int i = 2; i < socketMax; ++i) {
-        std::ostringstream procPath;
-        procPath << "/proc/" << procid << "/fd/" << i;
-
-        char buf[1024];
-        ssize_t len = readlink(procPath.str().c_str(), buf, sizeof(buf) - 1);
-        if (len < 0) {
-            continue;
-        }
-
-        buf[len] = '\0';
-        if (sscanf(buf, "socket:[%u]", &inode) == 1) {
-            validInode = true;
-        }
-    }
-
-    return validInode;
+    std::string host(online.host, strnlen(online.host, sizeof(online.host)));
+    std::size_t at = host.find('@');
+    return at == std::string::npos ? host : host.substr(at + 1);
 }
 
-std::string lookupSourceAddress(int32_t procid)
+pid_t tgid;  // daemon PID, from shm_cpid
+
+int tgkill(pid_t tid, int sig)
 {
-    u_int32_t inode;
-    if (!lookupSocketInode(procid, inode)) {
-        return "UNKNOWN";
-    }
-
-    FILE* f = std::fopen("/proc/net/tcp", "r");
-    if (f == NULL) {
-        return "UNKNOWN";
-    }
-
-    char buf[1024];
-    std::string sourceAddress = "UNKNOWN";
-    while (std::fgets(buf, sizeof(buf), f)) {
-        u_int32_t currentInode;
-        u_int32_t remoteAddr;
-        int n = std::sscanf(buf, "%*d: %*8x:%*4x %8x:%*4x %*2x %*8x:%*8x %*2x: %*8x%*8x %*d %*d %u",
-                            &remoteAddr, &currentInode);
-        if (n == EOF) {
-            break;
-        }
-
-        if (n != 2 || currentInode != inode) {
-            continue;
-        }
-
-        char remoteIP[INET_ADDRSTRLEN];
-        if (inet_ntop(AF_INET, &remoteAddr, remoteIP, sizeof(remoteIP))) {
-            sourceAddress = remoteIP;
-        }
-
-        break;
-    }
-
-    std::fclose(f);
-    return sourceAddress;
+    return syscall(SYS_tgkill, tgid, tid, sig);
 }
 
 History* getHistory(const std::string& username, const std::string& path)
@@ -305,61 +286,32 @@ void log(const char* format,...)
     std::fclose(f);
 }
 
+// A row is transferring iff status is "STOR <file>" and currentdir ends
+// with that file.  Anything else is a finished or not-yet-started transfer.
 std::string buildPath(const ONLINE& online)
 {
-    std::string realPath(GLFTPD_ROOT);
-    realPath += online.currentdir;
-
-    struct stat st;
-    if (stat(realPath.c_str(), &st) < 0) {
-        if (errno != ENOENT) {
-            log("Unable to stat path: %s: %s", online.currentdir, strerror(errno));
-        }
+    std::string filename(online.status + 5);
+    while (!filename.empty() && !std::isprint(filename[filename.size() - 1])) {
+        filename.resize(filename.size() - 1);
+    }
+    if (filename.empty()) {
         return "";
     }
 
-    std::string path(online.currentdir);
-    if (S_ISDIR(st.st_mode)) {
-        const char* filename = online.status + 5;
-        if (*filename == '\0') {
-            log("Malformed status: %s", online.status);
-            return "";
-        }
-        path += '/';
-        path += filename;
-        while (!std::isprint(path[path.size() - 1])) {
-            path.resize(path.size() - 1);
-        }
+    std::string path(online.currentdir, strnlen(online.currentdir, sizeof(online.currentdir)));
+    if (path.size() <= filename.size() ||
+        path.compare(path.size() - filename.size() - 1, std::string::npos, "/" + filename) != 0) {
+        return "";
     }
 
     return path;
-}
-
-void undupe(const std::string& username, const std::string& path)
-{
-    const char* filename = strrchr(path.c_str(), '/');
-    if (filename == NULL) {
-        log("Undupe failed, malformed path: %s: %s", username.c_str(), path.c_str());
-        return;
-    }
-    ++filename;
-
-    std::ostringstream command;
-    command << GLFTPD_ROOT << "/bin/undupe"
-            << " -u " << username
-            << " -f '" << filename << "'"
-            << " >/dev/null 2>/dev/null";
-
-    if (system(command.str().c_str()) < 0) {
-        log("Undupe failed: %s: %s: %s", username.c_str(), path.c_str(), strerror(errno));
-    }
 }
 
 bool needsKicking(const ONLINE& online, KickInfo& info)
 {
     if (online.procid == 0 ||
         strncasecmp(online.status, "STOR ", 5) != 0 ||
-        kill(online.procid, 0) < 0) {
+        tgkill(online.procid, 0) < 0) {
 
         return false;
     }
@@ -390,43 +342,34 @@ bool needsKicking(const ONLINE& online, KickInfo& info)
         return false;
     }
 
-    const std::string realPath = GLFTPD_ROOT + info.path;
-    if (access(realPath.c_str(), X_OK) != 0) {
-        return false;
-    }
-
     info.groupname = lookupGroup(online.groupid);
     info.procid = online.procid;
-    info.sourceAddress = lookupSourceAddress(online.procid);
+    info.sourceAddress = lookupSourceAddress(online);
 
     return true;
 }
 
 bool kick(const KickInfo& info)
 {
-    if (kill(info.procid, SIGTERM) < 0) {
-        if (errno != ESRCH) {
-            log("Unable to kill process: %ld: %s", (long) info.procid, strerror(errno));
-        }
-        return false;
-    }
-
     const std::string realPath = GLFTPD_ROOT + info.path;
 
     struct stat st;
     if (stat(realPath.c_str(), &st) < 0) {
         if (errno != ENOENT) {
             log("Unable to stat path: %s: %s", realPath.c_str(), strerror(errno));
-            return false;
         }
-    }
-
-    if (unlink(realPath.c_str()) < 0) {
-        log("Unable to delete file: %s: %s", realPath.c_str(), strerror(errno));
         return false;
     }
 
-    undupe(info.username, info.path);
+    // Never kill(): the TID belongs to the daemon's thread group, so a
+    // process-directed signal would hit the whole daemon.  The file is
+    // not deleted here either -- post_check decides its fate ($4=1).
+    if (tgkill(info.procid, KICK_SIGNAL) < 0) {
+        if (errno != ESRCH) {
+            log("Unable to signal transfer: %ld: %s", (long) info.procid, strerror(errno));
+        }
+        return false;
+    }
 
     const char *reason;
     GlftpdLogTag tag;
@@ -451,50 +394,70 @@ bool kick(const KickInfo& info)
     return true;
 }
 
-void detach_online(ONLINE* online)
+// fluffer removes and recreates the segment on every start, so a new
+// shmid (or IPC_STAT failing on the cached one) means the daemon
+// restarted: drop the old mapping and attach the new segment.
+ONLINE* onlineUsers = NULL;
+std::size_t numOnline = 0;
+int shmid = -1;
+
+void detach_online()
 {
-    shmdt(online);
+    if (onlineUsers != NULL) {
+        shmdt(onlineUsers);
+    }
+    onlineUsers = NULL;
+    numOnline = 0;
+    shmid = -1;
 }
 
-ONLINE* open_online(std::size_t& num)
+bool open_online()
 {
-    int shmid = shmget(IPC_KEY, 0, 0);
-    if (shmid < 0) {
-        if (errno == ENOENT) {
-            return NULL;
+    int id = shmget(IPC_KEY, 0, 0);
+    if (id < 0) {
+        if (errno != ENOENT) {
+            log("Unable to open online users: shmget: %s", strerror(errno));
         }
-        log("Unable to open online users: shmget: %s", strerror(errno));
-        return NULL;
+        detach_online();
+        return false;
     }
 
-    ONLINE* online = (ONLINE*) shmat(shmid, NULL, SHM_RDONLY);
-    if (online == (ONLINE*) -1) {
-        log("Unable to open online users: shmat: %s", strerror(errno));
-        return NULL;
-    }
-
-    struct shmid_ds	stat;
-    if (shmctl(shmid, IPC_STAT, &stat) < 0) {
+    struct shmid_ds stat;
+    if (shmctl(id, IPC_STAT, &stat) < 0) {
         log("Unable to open online users: shmctl: %s", strerror(errno));
-        detach_online(online);
-        return NULL;
+        detach_online();
+        return false;
     }
 
-    num = stat.shm_segsz / sizeof(ONLINE);
-    return online;
+    if (id == shmid && tgid == stat.shm_cpid) {
+        return true;
+    }
+
+    detach_online();
+    ONLINE* p = (ONLINE*) shmat(id, NULL, SHM_RDONLY);
+    if (p == (ONLINE*) -1) {
+        log("Unable to open online users: shmat: %s", strerror(errno));
+        return false;
+    }
+
+    onlineUsers = p;
+    shmid = id;
+    tgid = stat.shm_cpid;
+    numOnline = stat.shm_segsz / sizeof(ONLINE);
+    log("Attached online users: shmid %d, daemon pid %ld, %zu slots",
+        shmid, (long) tgid, numOnline);
+    return true;
 }
 
 void check()
 {
-    std::size_t numOnline;
-    ONLINE* online = open_online(numOnline);
-    if (online == NULL) {
+    if (!open_online()) {
         return;
     }
 
     for (std::size_t i = 0; i < numOnline; ++i) {
         KickInfo info;
-        if (!needsKicking(online[i], info)) {
+        if (!needsKicking(onlineUsers[i], info)) {
             continue;
         }
 
@@ -502,8 +465,6 @@ void check()
             incrNumKicks(info.username, info.path);
         }
     }
-
-    detach_online(online);
 }
 
 bool acquireLock()

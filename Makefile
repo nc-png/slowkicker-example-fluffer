@@ -1,6 +1,6 @@
 GLFTPD_PATH     := /glftpd
 
-CXXFLAGS := -O2 -Wall -Wextra -pedantic -I$(GLFTPD_PATH)/bin/sources
+CXXFLAGS := -O2 -Wall -Wextra -pedantic
 
 all:
 	$(CXX) $(CXXFLAGS) slowkicker.cpp -o slowkicker
